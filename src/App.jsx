@@ -15,49 +15,214 @@ const fmtF=n=>(n*100).toFixed(1)+"%";
 const netKg=p=>p.maxKg-p.tare;
 function getOrients(p,dims,mass){const net=netKg(p);return ORIENTS.map(o=>{const[dw,dd,dh]=[dims[o.a[0]],dims[o.a[1]],dims[o.a[2]]];const cW=Math.floor(p.w/dw),cD=Math.floor(p.d/dd),cH=Math.floor(p.h/dh);const qs=cW*cD*cH;let qpp=qs,lim=false;if(mass>0&&net>0){const qw=Math.floor(net/mass);if(qw<qs){qpp=qw;lim=true;}}return{l:o.l,cW,cD,cH,qs,qpp,lim};});}
 function getBest(os){return os.reduce((a,b)=>b.qpp>a.qpp?b:a,os[0]);}
-function calcSim(np,dp){let s=0,t=0;if(np.tag&&dp.tag){s+=(np.tag===dp.tag?40:0);t+=40;}const nv=np.w*np.d*np.h,dv=dp.w*dp.d*dp.h;if(nv>0&&dv>0){s+=(Math.min(nv,dv)/Math.max(nv,dv))*60;t+=60;}return t>0?(s/t)*100:0;}
+// ── 형상 특징 추출 ────────────────────────────────────────
+function shapeFeatures(w,d,h){
+  if(!w||!d||!h) return null;
+  const dims=[w,d,h].sort((a,b)=>b-a); // [최대, 중간, 최소]
+  const longest=dims[0],mid=dims[1],shortest=dims[2];
+  return{
+    flatness: shortest/longest,          // 납작도: 낮을수록 납작함 (0~1)
+    elongation: longest/mid,             // 길쭉도: 높을수록 길쭉함 (1~∞)
+    squareness: mid/longest,             // 정방형도: 높을수록 정육면체에 가까움
+    volume: w*d*h,
+  };
+}
 
+// ── 형상 분류 레이블 (디버깅/표시용) ────────────────────────
+function shapeLabel(f){
+  if(!f) return "—";
+  if(f.flatness<0.2) return "극납작";
+  if(f.flatness<0.4) return "납작형";
+  if(f.elongation>4) return "극길쭉";
+  if(f.elongation>2.5) return "길쭉형";
+  if(f.squareness>0.7&&f.flatness>0.5) return "블록형";
+  return "중간형";
+}
+
+// ── 3요소 통합 유사도 계산 (100점 만점) ────────────────────
+// 1. 태그 일치: 40점
+// 2. 치수 비율(납작도+길쭉도) 유사도: 30점
+// 3. 부피 유사도 (±50% 구간 내 선형): 30점
+function calcSim(np,dp){
+  let score=0;
+
+  // 1. 태그 일치 (40점)
+  if(np.tag&&dp.tag){
+    score+=(np.tag===dp.tag?40:0);
+  }
+
+  const nf=shapeFeatures(+np.w,+np.d,+np.h);
+  const df=shapeFeatures(+dp.w,+dp.d,+dp.h);
+
+  // 2. 치수 비율 유사도 (30점)
+  // 납작도·길쭉도·정방형도 각 10점씩
+  if(nf&&df){
+    const flatSim=1-Math.abs(nf.flatness-df.flatness);        // 0~1
+    const elongSim=1-Math.min(1,Math.abs(nf.elongation-df.elongation)/Math.max(nf.elongation,df.elongation));
+    const squareSim=1-Math.abs(nf.squareness-df.squareness);
+    score+=(flatSim*10)+(elongSim*10)+(squareSim*10);
+  }
+
+  // 3. 부피 유사도 (30점)
+  // ±50% 범위 내: 선형 점수, 범위 밖: 0점
+  if(nf&&df&&nf.volume>0&&df.volume>0){
+    const ratio=Math.min(nf.volume,df.volume)/Math.max(nf.volume,df.volume); // 0~1
+    // 0.5 이상이면 선형 점수 (0.5→0점, 1.0→30점)
+    score+=(ratio>=0.5?((ratio-0.5)/0.5)*30:0);
+  }
+
+  return Math.min(100,score);
+}
+
+// ── 동일 제품 판단 (95% 사이즈 일치 + 태그 일치) ────────────
+function isSameProduct(np,dp){
+  if(!np.tag||!dp.tag||np.tag!==dp.tag)return false;
+  return["w","d","h"].every(k=>{
+    const nv=parseFloat(np[k])||0,dv=parseFloat(dp[k])||0;
+    if(nv<=0||dv<=0)return false;
+    return Math.min(nv,dv)/Math.max(nv,dv)>=0.95;
+  });
+}
+
+// ── 충전율 계산용 필터 (태그 + 형상 유사 + 부피 구간) ────────
+function filterForFillRate(newP, dbList){
+  const nf=shapeFeatures(+newP.w,+newP.d,+newP.h);
+  if(!nf) return [];
+
+  // 1단계: 태그 일치 필터
+  const tagMatched=dbList.filter(x=>x.tag===newP.tag&&x.actual>0&&x.w>0&&x.d>0&&x.h>0);
+  if(tagMatched.length===0) return [];
+
+  // 2단계: 부피 구간 ±50% 필터
+  const volFiltered=tagMatched.filter(x=>{
+    const df=shapeFeatures(+x.w,+x.d,+x.h);
+    if(!df) return false;
+    const ratio=Math.min(nf.volume,df.volume)/Math.max(nf.volume,df.volume);
+    return ratio>=0.5; // 부피 차이 50% 이내
+  });
+  const useVol=volFiltered.length>=3?volFiltered:tagMatched; // 3개 미만이면 태그 전체 사용
+
+  // 3단계: 치수 비율 유사도 상위 필터 (전체의 60% 또는 최소 5개)
+  const scored=useVol.map(x=>{
+    const df=shapeFeatures(+x.w,+x.d,+x.h);
+    if(!df) return{...x,shapeSim:0};
+    const flatSim=1-Math.abs(nf.flatness-df.flatness);
+    const elongSim=1-Math.min(1,Math.abs(nf.elongation-df.elongation)/Math.max(nf.elongation,df.elongation));
+    return{...x,shapeSim:(flatSim+elongSim)/2};
+  }).sort((a,b)=>b.shapeSim-a.shapeSim);
+
+  const minCount=Math.max(5,Math.ceil(scored.length*0.6));
+  return scored.slice(0,minCount);
+}
+
+// ── 단일 제품 견적 계산 순수 함수 ──────────────────────────
+function calcOneProduct(prod, db){
+  // prod: {partNo,name,tag,w,d,h,mass,annualQty,palletId(optional)}
+  const pw=+prod.w,pd=+prod.d,ph=+prod.h,mass=+prod.mass,aq=+prod.annualQty;
+  if(!pw||!pd||!ph) return null;
+
+  const newP={tag:prod.tag,w:pw,d:pd,h:ph,mass};
+  const scored=db.filter(x=>x.w>0&&x.d>0&&x.h>0&&x.actual>0)
+    .map(x=>({...x,score:calcSim(newP,x),exactMatch:isSameProduct(newP,x)}))
+    .sort((a,b)=>b.score-a.score);
+
+  // 파렛트 결정: prod.palletId 있으면 그대로, 없으면 DB 기반 자동
+  let palletId=prod.palletId||null;
+  if(!palletId){
+    const votes={};
+    const src=scored.filter(x=>x.tag===prod.tag&&x.palletId).length>0
+      ?scored.filter(x=>x.tag===prod.tag):scored.slice(0,10);
+    src.forEach(x=>{votes[x.palletId]=(votes[x.palletId]||0)+x.score;});
+    const top=Object.keys(votes).sort((a,b)=>votes[b]-votes[a])[0];
+    palletId=top?+top:null;
+  }
+  const p=PALLETS.find(x=>x.id===palletId);
+  if(!p) return {prod,error:"파렛트 미선택",scored};
+
+  const orients=getOrients(p,[pw,pd,ph],mass);
+  const best=getBest(orients);
+  const pVol=p.w*p.d*p.h,pv=pw*pd*ph,net=netKg(p);
+
+  // 동일 제품 매칭
+  const exactMatches=scored.filter(m=>m.exactMatch&&m.actual>0);
+  if(exactMatches.length>0){
+    const estQ=Math.round(exactMatches.reduce((s,m)=>s+m.actual,0)/exactMatches.length);
+    return{prod,p,best,qpp:best.qpp,estQ,avgFill:null,exactMatch:true,exactCount:exactMatches.length,tagMatchCount:0,pVol,pv,net,mass,aq,scored};
+  }
+
+  // 동일 태그 충전율 — 3요소 필터 적용
+  const fillSource=filterForFillRate(prod,db);
+  if(fillSource.length===0){
+    return{prod,p,best,qpp:best.qpp,estQ:null,avgFill:null,exactMatch:false,tagMatchCount:0,noData:true,pVol,pv,net,mass,aq,scored};
+  }
+  const fills=fillSource.map(m=>m.actual*(m.w*m.d*m.h)/pVol);
+  const avgFill=fills.reduce((a,b)=>a+b,0)/fills.length;
+  let estQ=Math.round(pVol*avgFill/pv);
+  if(estQ!==null&&mass>0&&net>0){const qw=Math.floor(net/mass);if(qw<estQ)estQ=qw;}
+  return{prod,p,best,qpp:best.qpp,estQ,avgFill,exactMatch:false,tagMatchCount:fillSource.length,pVol,pv,net,mass,aq,scored};
+}
+
+// 참조 이미지 기준 라이트 테마
+const C={
+  bg:"#f0f2f5",          // 전체 배경
+  sidebar:"#1e2333",     // 사이드바 (참조 이미지 좌측 다크)
+  sideText:"#a0aec0",
+  sideActive:"#ffffff",
+  sideActiveBg:"rgba(255,255,255,0.12)",
+  card:"#ffffff",        // 카드 흰색
+  border:"#e2e8f0",
+  text:"#1a202c",        // 본문 텍스트
+  textSub:"#718096",
+  textMuted:"#a0aec0",
+  blue:"#3b82f6",
+  green:"#22c55e",
+  amber:"#f59e0b",
+  purple:"#8b5cf6",
+  red:"#ef4444",
+  input:"#ffffff",
+  inputBorder:"#d1d5db",
+};
 const S={
-  wrap:{display:"flex",minHeight:"100vh",background:"#0f1117",fontFamily:"'Pretendard','Apple SD Gothic Neo','Malgun Gothic',sans-serif",color:"#e8eaf0"},
-  sidebar:{width:240,background:"#161b27",borderRight:"1px solid #1e2535",display:"flex",flexDirection:"column",flexShrink:0,position:"sticky",top:0,height:"100vh"},
-  sideHeader:{padding:"20px 20px 16px",borderBottom:"1px solid #1e2535"},
-  sideLogo:{fontSize:13,fontWeight:700,color:"#4f8ef7",letterSpacing:"0.08em",textTransform:"uppercase"},
-  sideSubtitle:{fontSize:11,color:"#4a5568",marginTop:3},
+  wrap:{display:"flex",minHeight:"100vh",background:C.bg,fontFamily:"'Pretendard','Apple SD Gothic Neo','Malgun Gothic',sans-serif",color:C.text},
+  sidebar:{width:220,background:C.sidebar,borderRight:"none",display:"flex",flexDirection:"column",flexShrink:0,position:"sticky",top:0,height:"100vh"},
+  sideHeader:{padding:"20px 20px 16px",borderBottom:"1px solid rgba(255,255,255,0.08)"},
+  sideLogo:{fontSize:13,fontWeight:700,color:"#ffffff",letterSpacing:"0.08em",textTransform:"uppercase"},
+  sideSubtitle:{fontSize:11,color:C.sideText,marginTop:3},
   sideNav:{padding:"12px 8px",flex:1},
-  navItem:(active)=>({display:"flex",alignItems:"center",gap:10,padding:"9px 12px",borderRadius:8,cursor:"pointer",fontSize:13,fontWeight:active?600:400,color:active?"#4f8ef7":"#7a8499",background:active?"rgba(79,142,247,0.1)":"transparent",marginBottom:4,transition:"all 0.15s"}),
+  navItem:(active)=>({display:"flex",alignItems:"center",gap:10,padding:"9px 12px",borderRadius:8,cursor:"pointer",fontSize:13,fontWeight:active?600:400,color:active?C.sideActive:C.sideText,background:active?C.sideActiveBg:"transparent",marginBottom:4,transition:"all 0.15s"}),
   navIcon:{width:16,height:16,flexShrink:0},
-  main:{flex:1,padding:"24px 28px",overflowY:"auto"},
-  pageTitle:{fontSize:20,fontWeight:700,color:"#e8eaf0",marginBottom:4},
-  pageSubtitle:{fontSize:13,color:"#4a5568",marginBottom:24},
-  kpiGrid:{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:14,marginBottom:28},
-  kpiCard:(color)=>({background:"#161b27",border:`1px solid ${color}33`,borderRadius:12,padding:"16px 20px",position:"relative",overflow:"hidden"}),
-  kpiLabel:{fontSize:11,color:"#4a5568",fontWeight:600,letterSpacing:"0.06em",textTransform:"uppercase",marginBottom:8},
-  kpiValue:{fontSize:28,fontWeight:700,lineHeight:1},
-  kpiUnit:{fontSize:12,color:"#4a5568",marginTop:4},
-  kpiAccent:(color)=>({position:"absolute",top:0,left:0,right:0,height:3,background:color,borderRadius:"12px 12px 0 0"}),
-  section:{background:"#161b27",border:"1px solid #1e2535",borderRadius:12,padding:"20px 24px",marginBottom:20},
-  sectionTitle:{fontSize:13,fontWeight:600,color:"#9aa3b2",letterSpacing:"0.05em",textTransform:"uppercase",marginBottom:16,display:"flex",alignItems:"center",gap:8},
+  main:{flex:1,padding:"24px 28px",overflowY:"auto",background:C.bg},
+  pageTitle:{fontSize:20,fontWeight:700,color:C.text,marginBottom:4},
+  pageSubtitle:{fontSize:13,color:C.textSub,marginBottom:24},
+  kpiGrid:{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:14,marginBottom:24},
+  kpiCard:(color)=>({background:C.card,border:`1.5px solid ${color}`,borderRadius:12,padding:"18px 20px",position:"relative",overflow:"hidden",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}),
+  kpiLabel:{fontSize:11,color:C.textSub,fontWeight:600,letterSpacing:"0.06em",textTransform:"uppercase",marginBottom:8},
+  kpiValue:{fontSize:28,fontWeight:700,lineHeight:1,color:C.text},
+  kpiUnit:{fontSize:12,color:C.textMuted,marginTop:4},
+  kpiAccent:(color)=>({position:"absolute",top:0,left:0,right:0,height:4,background:color,borderRadius:"12px 12px 0 0"}),
+  section:{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"20px 24px",marginBottom:16,boxShadow:"0 1px 3px rgba(0,0,0,0.05)"},
+  sectionTitle:{fontSize:12,fontWeight:700,color:C.textSub,letterSpacing:"0.06em",textTransform:"uppercase",marginBottom:16,display:"flex",alignItems:"center",gap:8},
   grid4:{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12},
   grid6:{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:10},
   grid2:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12},
   grid3:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12},
-  label:{fontSize:11,color:"#4a5568",fontWeight:600,letterSpacing:"0.04em",textTransform:"uppercase",marginBottom:5,display:"block"},
-  input:{width:"100%",boxSizing:"border-box",background:"#0f1117",border:"1px solid #1e2535",borderRadius:7,padding:"8px 10px",fontSize:13,color:"#e8eaf0",outline:"none",fontFamily:"inherit"},
-  select:{width:"100%",boxSizing:"border-box",background:"#0f1117",border:"1px solid #1e2535",borderRadius:7,padding:"8px 10px",fontSize:13,color:"#e8eaf0",outline:"none",fontFamily:"inherit",appearance:"none"},
-  btn:(variant)=>({padding:"9px 18px",borderRadius:7,border:"none",cursor:"pointer",fontSize:13,fontWeight:600,fontFamily:"inherit",...(variant==="primary"?{background:"#4f8ef7",color:"#fff"}:variant==="success"?{background:"#22c55e",color:"#fff"}:{background:"#1e2535",color:"#9aa3b2"})}),
+  label:{fontSize:11,color:C.textSub,fontWeight:600,letterSpacing:"0.04em",textTransform:"uppercase",marginBottom:5,display:"block"},
+  input:{width:"100%",boxSizing:"border-box",background:C.input,border:`1px solid ${C.inputBorder}`,borderRadius:7,padding:"8px 10px",fontSize:13,color:C.text,outline:"none",fontFamily:"inherit"},
+  select:{width:"100%",boxSizing:"border-box",background:C.input,border:`1px solid ${C.inputBorder}`,borderRadius:7,padding:"8px 10px",fontSize:13,color:C.text,outline:"none",fontFamily:"inherit",appearance:"none"},
+  btn:(variant)=>({padding:"9px 18px",borderRadius:7,border:"none",cursor:"pointer",fontSize:13,fontWeight:600,fontFamily:"inherit",...(variant==="primary"?{background:C.blue,color:"#fff"}:variant==="success"?{background:C.green,color:"#fff"}:{background:"#f1f5f9",color:C.textSub,border:`1px solid ${C.border}`})}),
   palletGrid:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10},
-  palletCard:(sel)=>({background:sel?"rgba(79,142,247,0.08)":"#0f1117",border:`1.5px solid ${sel?"#4f8ef7":"#1e2535"}`,borderRadius:10,padding:"12px 14px",cursor:"pointer",transition:"all 0.15s"}),
+  palletCard:(sel)=>({background:sel?"#eff6ff":"#f8fafc",border:`1.5px solid ${sel?C.blue:C.border}`,borderRadius:10,padding:"12px 14px",cursor:"pointer",transition:"all 0.15s"}),
   orientGrid:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8},
-  orientCard:(best,lim)=>({background:best?"rgba(34,197,94,0.06)":lim?"rgba(245,158,11,0.06)":"#0f1117",border:`1px solid ${best?"#22c55e":lim?"#f59e0b":"#1e2535"}`,borderRadius:8,padding:"10px",textAlign:"center"}),
-  resultGrid:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:16},
-  resultCard:(color)=>({background:"#0f1117",border:`1px solid ${color}44`,borderRadius:10,padding:"16px 20px"}),
-  tag:(color)=>({display:"inline-block",fontSize:10,padding:"2px 7px",borderRadius:4,fontWeight:600,letterSpacing:"0.04em",...(color==="blue"?{background:"rgba(79,142,247,0.15)",color:"#4f8ef7"}:color==="green"?{background:"rgba(34,197,94,0.15)",color:"#22c55e"}:{background:"rgba(245,158,11,0.15)",color:"#f59e0b"})}),
-  divider:{border:"none",borderTop:"1px solid #1e2535",margin:"14px 0"},
-  weightBar:{background:"#0f1117",borderRadius:10,padding:"14px 16px",border:"1px solid #1e2535",marginTop:12},
-  barTrack:{height:6,background:"#1e2535",borderRadius:3,overflow:"hidden",margin:"8px 0 6px"},
-  msg:{textAlign:"center",padding:"2rem",color:"#4a5568",fontSize:13},
-  matchCard:(top)=>({display:"flex",alignItems:"center",gap:10,padding:"9px 12px",borderRadius:8,background:top?"rgba(34,197,94,0.05)":"transparent",border:top?"1px solid #22c55e33":"1px solid transparent",marginBottom:6}),
-  dbRow:{display:"flex",alignItems:"center",gap:10,padding:"10px 12px",background:"#0f1117",borderRadius:8,border:"1px solid #1e2535",marginBottom:6},
+  orientCard:(best,lim)=>({background:best?"#f0fdf4":lim?"#fffbeb":"#f8fafc",border:`1px solid ${best?"#86efac":lim?"#fcd34d":C.border}`,borderRadius:8,padding:"10px",textAlign:"center"}),
+  resultGrid:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:14},
+  resultCard:(color)=>({background:"#f8fafc",border:`1.5px solid ${color}55`,borderRadius:10,padding:"16px 18px"}),
+  tag:(color)=>({display:"inline-block",fontSize:10,padding:"2px 8px",borderRadius:4,fontWeight:600,letterSpacing:"0.04em",...(color==="blue"?{background:"#dbeafe",color:"#1d4ed8"}:color==="green"?{background:"#dcfce7",color:"#15803d"}:{background:"#fef3c7",color:"#b45309"})}),
+  divider:{border:"none",borderTop:`1px solid ${C.border}`,margin:"14px 0"},
+  weightBar:{background:"#f8fafc",borderRadius:10,padding:"14px 16px",border:`1px solid ${C.border}`,marginTop:12},
+  barTrack:{height:7,background:"#e2e8f0",borderRadius:4,overflow:"hidden",margin:"8px 0 6px"},
+  msg:{textAlign:"center",padding:"2rem",color:C.textMuted,fontSize:13},
+  matchCard:(top)=>({display:"flex",alignItems:"center",gap:10,padding:"9px 12px",borderRadius:8,background:top?"#f0fdf4":"transparent",border:top?"1px solid #86efac":"1px solid transparent",marginBottom:6}),
+  dbRow:{display:"flex",alignItems:"center",gap:10,padding:"10px 12px",background:"#f8fafc",borderRadius:8,border:`1px solid ${C.border}`,marginBottom:6},
 };
 
 function NavIcon({type}){
@@ -75,7 +240,7 @@ function KpiCard({label,value,unit,color,sub}){
       <div style={S.kpiLabel}>{label}</div>
       <div style={{...S.kpiValue,color}}>{value}</div>
       {unit&&<div style={S.kpiUnit}>{unit}</div>}
-      {sub&&<div style={{fontSize:11,color:"#4a5568",marginTop:6}}>{sub}</div>}
+      {sub&&<div style={{fontSize:11,color:C.textSub,marginTop:6}}>{sub}</div>}
     </div>
   );
 }
@@ -92,6 +257,112 @@ export default function App(){
   const[dbPage,setDbPage]=useState(0);
   const DB_PAGE=20;
   const allTags=[...new Set(db.map(x=>x.tag).filter(Boolean))].sort();
+
+  // ── 일괄 처리 상태 ──
+  const[batchItems,setBatchItems]=useState([]); // 업로드된 제품 목록
+  const[batchResults,setBatchResults]=useState({}); // {idx: calcResult}
+  const[selectedIdx,setSelectedIdx]=useState(null); // 선택된 품번 인덱스
+  const[batchLoading,setBatchLoading]=useState(false);
+  const batchFileRef=useRef();
+
+  // ── 엑셀 파싱 (SheetJS) ──
+  function parseExcel(file){
+    const r=new FileReader();
+    r.onload=e=>{
+      try{
+        const XLSX=window.XLSX;
+        if(!XLSX){alert("엑셀 라이브러리 로딩 중입니다. 잠시 후 다시 시도해주세요.");return;}
+        const wb=XLSX.read(new Uint8Array(e.target.result),{type:"array"});
+        const ws=wb.Sheets[wb.SheetNames[0]];
+        const rows=XLSX.utils.sheet_to_json(ws,{defval:""});
+        // 컬럼 매핑 (한글/영문 혼용 대응)
+        const colMap={
+          partNo:["품번","part_no","partno","partnumber","part no"],
+          name:["품명","name","품목명"],
+          tag:["구분","태그","tag","구분(태그)","분류"],
+          w:["가로","w","width","가로(mm)"],
+          d:["세로","d","depth","세로(mm)"],
+          h:["높이","h","height","높이(mm)"],
+          mass:["중량","mass","weight","중량(kg)","무게"],
+          annualQty:["연간수량","연간 수량","annual_qty","annualqty","연간생산수량","연간 생산수량","수량"],
+        };
+        function getVal(row,keys){
+          for(const k of keys){
+            const found=Object.keys(row).find(rk=>rk.trim().toLowerCase()===k.toLowerCase());
+            if(found!==undefined&&row[found]!=="")return row[found];
+          }
+          return "";
+        }
+        const items=rows.map((row,i)=>({
+          _idx:i,
+          partNo:String(getVal(row,colMap.partNo)||""),
+          name:String(getVal(row,colMap.name)||""),
+          tag:String(getVal(row,colMap.tag)||""),
+          w:+getVal(row,colMap.w)||0,
+          d:+getVal(row,colMap.d)||0,
+          h:+getVal(row,colMap.h)||0,
+          mass:+getVal(row,colMap.mass)||0,
+          annualQty:+getVal(row,colMap.annualQty)||0,
+        })).filter(x=>x.w>0&&x.d>0&&x.h>0);
+        if(items.length===0){alert("유효한 데이터가 없습니다. 가로/세로/높이 컬럼을 확인해주세요.");return;}
+        setBatchItems(items);
+        setBatchResults({});
+        setSelectedIdx(null);
+        // 자동 계산
+        setBatchLoading(true);
+        setTimeout(()=>{
+          const results={};
+          items.forEach((item,i)=>{results[i]=calcOneProduct(item,db);});
+          setBatchResults(results);
+          setSelectedIdx(0);
+          setBatchLoading(false);
+        },50);
+      }catch(err){alert("엑셀 파싱 오류: "+err.message);}
+    };
+    r.readAsArrayBuffer(file);
+  }
+
+  // ── 엑셀 다운로드 ──
+  function downloadExcel(){
+    const XLSX=window.XLSX;
+    if(!XLSX){alert("엑셀 라이브러리 로딩 중입니다.");return;}
+    const rows=batchItems.map((item,i)=>{
+      const r=batchResults[i];
+      if(!r||r.error) return{품번:item.partNo,품명:item.name,구분:item.tag,가로:item.w,세로:item.d,높이:item.h,중량:item.mass,연간수량:item.annualQty,파렛트:"오류",계산적입수:"",계산개당단가:"",계산연간포장비:"",추정적입수:"",추정개당단가:"",추정연간포장비:"",비고:r?.error||"파렛트 미선택"};
+      const{p,best,qpp,estQ,avgFill,exactMatch,tagMatchCount,noData,aq}=r;
+      const cUC=qpp>0?Math.round(p.price/qpp):0;
+      const cPC=qpp>0&&aq>0?Math.ceil(aq/qpp):0;
+      const cTC=p.price*cPC;
+      const ePC=estQ&&aq>0?Math.ceil(aq/estQ):0;
+      const eUC=estQ?Math.round(p.price/estQ):0;
+      const eTC=p.price*ePC;
+      const note=noData?"DB 비교군 없음":exactMatch?`실적값 직접 적용(${r.exactCount}개 평균)`:`동일태그 ${tagMatchCount}개 충전율 ${avgFill?(avgFill*100).toFixed(1)+"%":"—"}`;
+      return{품번:item.partNo,품명:item.name,구분:item.tag,가로:item.w,세로:item.d,높이:item.h,중량:item.mass,연간수량:aq,파렛트:p.name,
+        계산적입수:qpp,계산개당단가:cUC,계산연간포장비:cTC,
+        추정적입수:estQ||"",추정개당단가:estQ?eUC:"",추정연간포장비:estQ?eTC:"",비고:note};
+    });
+    const ws=XLSX.utils.json_to_sheet(rows);
+    // 컬럼 너비 설정
+    ws["!cols"]=[{wch:16},{wch:30},{wch:14},{wch:8},{wch:8},{wch:8},{wch:8},{wch:10},{wch:14},{wch:10},{wch:12},{wch:14},{wch:10},{wch:12},{wch:14},{wch:30}];
+    const wb=XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb,ws,"견적결과");
+    XLSX.writeFile(wb,`포장견적_${new Date().toISOString().slice(0,10)}.xlsx`);
+  }
+
+  // ── 샘플 엑셀 다운로드 ──
+  function downloadSample(){
+    const XLSX=window.XLSX;
+    if(!XLSX){alert("엑셀 라이브러리 로딩 중입니다.");return;}
+    const sample=[
+      {품번:"54530-S1000",품명:"B/JOINT-ASS'Y",구분:"B/JOINT",가로:145,세로:72,높이:82,중량:0.769,연간수량:10000},
+      {품번:"55280-S1000W",품명:"RR T/ARM ASSY,LH",구분:"T/ARM RR",가로:497,세로:181,높이:61,중량:1.478,연간수량:8000},
+    ];
+    const ws=XLSX.utils.json_to_sheet(sample);
+    ws["!cols"]=[{wch:16},{wch:30},{wch:14},{wch:8},{wch:8},{wch:8},{wch:8},{wch:10}];
+    const wb=XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb,ws,"입력양식");
+    XLSX.writeFile(wb,"견적입력_양식.xlsx");
+  }
 
   async function analyzeImage(b64){
     try{const res=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:200,messages:[{role:"user",content:[{type:"image",source:{type:"base64",media_type:"image/jpeg",data:b64}},{type:"text",text:'자동차 부품 형상을 JSON으로만 답: {"shape_tags":["플레이트","브라켓","하우징","파이프","기어","커버","링","복합형"]에서 해당,"flat_ratio":0~1,"elongated_ratio":0~1,"complexity":0~1}'}]}]})});const d=await res.json();return JSON.parse((d.content?.[0]?.text||"{}").replace(/```json|```/g,"").trim());}catch{return{};}
@@ -111,14 +382,17 @@ export default function App(){
   useEffect(()=>{
     const pw=+quote.w,pd=+quote.d,ph=+quote.h;
     if(!pw||!pd||!ph){setMatched([]);setQResult(null);return;}
-    const scored=db.filter(x=>x.w>0&&x.d>0&&x.h>0&&x.actual>0).map(x=>({...x,score:calcSim({tag:quote.tag,w:pw,d:pd,h:ph},x)})).sort((a,b)=>b.score-a.score);
+    const newP={tag:quote.tag,w:pw,d:pd,h:ph,mass:+quote.mass};
+    const scored=db.filter(x=>x.w>0&&x.d>0&&x.h>0&&x.actual>0)
+      .map(x=>({...x,score:calcSim(newP,x),exactMatch:isSameProduct(newP,x)}))
+      .sort((a,b)=>b.score-a.score);
     setMatched(scored);
     if(!quote.palletId){
       const votes={};(scored.filter(x=>x.tag===quote.tag&&x.palletId).length>0?scored.filter(x=>x.tag===quote.tag):scored.slice(0,10)).forEach(x=>{votes[x.palletId]=(votes[x.palletId]||0)+x.score;});
       const top=Object.keys(votes).sort((a,b)=>votes[b]-votes[a])[0];
       if(top)setQuote(q=>({...q,palletId:+top}));
     }
-  },[quote.tag,quote.w,quote.d,quote.h,quote.shapeData,db]);
+  },[quote.tag,quote.w,quote.d,quote.h,quote.mass,quote.shapeData,db]);
 
   useEffect(()=>{
     const p=PALLETS.find(x=>x.id===quote.palletId);
@@ -127,11 +401,26 @@ export default function App(){
     const orients=getOrients(p,[pw,pd,ph],mass);
     const best=getBest(orients);
     const pVol=p.w*p.d*p.h,pv=pw*pd*ph,net=netKg(p);
-    const fills=matched.filter(m=>m.actual>0&&m.w>0&&m.d>0&&m.h>0).map(m=>m.actual*(m.w*m.d*m.h)/pVol);
-    const avgFill=fills.length>0?fills.reduce((a,b)=>a+b,0)/fills.length:null;
-    let estQ=avgFill!==null&&pv>0?Math.round(pVol*avgFill/pv):null;
+
+    // 1. 동일 제품(95% 이상) 매칭 → 실적입수량 직접 사용
+    const exactMatches=matched.filter(m=>m.exactMatch&&m.actual>0);
+    if(exactMatches.length>0){
+      const exactQpp=Math.round(exactMatches.reduce((s,m)=>s+m.actual,0)/exactMatches.length);
+      setQResult({p,orients,best,qpp:best.qpp,avgFill:null,estQ:exactQpp,pVol,pv,net,mass,aq,exactMatch:true,exactCount:exactMatches.length});
+      return;
+    }
+
+    // 2. 태그+형상비율+부피 3요소 필터로 충전율 계산
+    const fillSource=filterForFillRate({tag:quote.tag,w:pw,d:pd,h:ph},matched);
+    if(fillSource.length===0){
+      setQResult({p,orients,best,qpp:best.qpp,avgFill:null,estQ:null,pVol,pv,net,mass,aq,exactMatch:false,tagMatchCount:0,noData:true});
+      return;
+    }
+    const fills=fillSource.map(m=>m.actual*(m.w*m.d*m.h)/pVol);
+    const avgFill=fills.reduce((a,b)=>a+b,0)/fills.length;
+    let estQ=pv>0?Math.round(pVol*avgFill/pv):null;
     if(estQ!==null&&mass>0&&net>0){const qw=Math.floor(net/mass);if(qw<estQ)estQ=qw;}
-    setQResult({p,orients,best,qpp:best.qpp,avgFill,estQ,pVol,pv,net,mass,aq});
+    setQResult({p,orients,best,qpp:best.qpp,avgFill,estQ,pVol,pv,net,mass,aq,exactMatch:false,tagMatchCount:fillSource.length,noData:false});
   },[quote,matched]);
 
   const filteredDb=db.filter(x=>!dbSearch||(x.tag||"").toLowerCase().includes(dbSearch.toLowerCase())||(x.name||"").toLowerCase().includes(dbSearch.toLowerCase())||(x.partNo||"").toLowerCase().includes(dbSearch.toLowerCase()));
@@ -161,12 +450,12 @@ export default function App(){
             <NavIcon type="quote"/>견적 산출
           </div>
           <div style={S.navItem(tab==="db")} onClick={()=>setTab("db")}>
-            <NavIcon type="db"/>유사 제품 DB <span style={{marginLeft:"auto",fontSize:11,background:"#1e2535",color:"#4a5568",padding:"1px 7px",borderRadius:10}}>{db.length}</span>
+            <NavIcon type="db"/>유사 제품 DB <span style={{marginLeft:"auto",fontSize:11,background:"rgba(255,255,255,0.1)",color:"#a0aec0",padding:"1px 7px",borderRadius:10}}>{db.length}</span>
           </div>
         </div>
-        <div style={{padding:"16px 20px",borderTop:"1px solid #1e2535",fontSize:11,color:"#4a5568"}}>
+        <div style={{padding:"16px 20px",borderTop:"1px solid rgba(255,255,255,0.08)",fontSize:11,color:"#a0aec0"}}>
           <div style={{marginBottom:4}}>파렛트 단가 기준</div>
-          <div style={{color:"#7a8499"}}>'26. 2분기</div>
+          <div style={{color:"#718096"}}>'26. 2분기</div>
         </div>
       </div>
 
@@ -175,14 +464,106 @@ export default function App(){
         {tab==="quote"?(
           <>
             <div style={S.pageTitle}>포장 견적 산출</div>
-            <div style={S.pageSubtitle}>제품 사이즈를 입력하면 유사 제품 DB를 기반으로 최적 파렛트와 포장 단가를 자동 산출합니다</div>
+            <div style={S.pageSubtitle}>제품 사이즈를 직접 입력하거나, 엑셀 파일로 여러 제품을 한번에 계산할 수 있습니다</div>
+
+            {/* 엑셀 업로드 바 */}
+            <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"14px 20px",marginBottom:16,display:"flex",alignItems:"center",gap:14,boxShadow:"0 1px 3px rgba(0,0,0,0.05)"}}>
+              <div style={{fontSize:13,fontWeight:600,color:C.text,whiteSpace:"nowrap"}}>📊 일괄 계산</div>
+              <div style={{fontSize:12,color:C.textSub,flex:1}}>엑셀 업로드 시 품번/품명/구분/가로/세로/높이/중량/연간수량 컬럼을 읽어 자동 계산합니다</div>
+              <button onClick={downloadSample} style={{...S.btn("default"),whiteSpace:"nowrap",fontSize:12}}>양식 다운로드</button>
+              <label style={{...S.btn("primary"),whiteSpace:"nowrap",fontSize:12,cursor:"pointer",display:"inline-block"}}>
+                {batchLoading?"계산 중...":"📂 엑셀 업로드"}
+                <input ref={batchFileRef} type="file" accept=".xlsx,.xls" style={{display:"none"}} onChange={e=>{if(e.target.files[0])parseExcel(e.target.files[0]);e.target.value="";}}/>
+              </label>
+              {batchItems.length>0&&(
+                <>
+                  <button onClick={downloadExcel} style={{...S.btn("default"),whiteSpace:"nowrap",fontSize:12,background:"#f0fdf4",color:"#15803d",border:"1px solid #86efac"}}>⬇ 결과 엑셀</button>
+                  <button onClick={()=>{setBatchItems([]);setBatchResults({});setSelectedIdx(null);}} style={{background:"none",border:"none",cursor:"pointer",color:C.textMuted,fontSize:18,padding:"0 4px"}}>×</button>
+                </>
+              )}
+            </div>
+
+            {/* 일괄 계산 품번 목록 */}
+            {batchItems.length>0&&(
+              <div style={{display:"grid",gridTemplateColumns:"220px 1fr",gap:16,marginBottom:16}}>
+                {/* 좌: 품번 목록 */}
+                <div style={{...S.section,padding:"12px",maxHeight:480,overflowY:"auto",marginBottom:0}}>
+                  <div style={{fontSize:11,fontWeight:700,color:C.textSub,letterSpacing:"0.06em",textTransform:"uppercase",marginBottom:10,padding:"0 4px"}}>{batchItems.length}개 제품</div>
+                  {batchItems.map((item,i)=>{
+                    const r=batchResults[i];
+                    const isSel=selectedIdx===i;
+                    const hasNoData=r?.noData;
+                    const hasError=r?.error;
+                    const isExact=r?.exactMatch;
+                    const dot=hasError?"#ef4444":hasNoData?"#f59e0b":isExact?"#8b5cf6":r?.estQ?C.green:C.blue;
+                    return(
+                      <div key={i} onClick={()=>{setSelectedIdx(i);setQuote(q=>({...q,tag:item.tag,w:String(item.w),d:String(item.d),h:String(item.h),mass:String(item.mass),annualQty:String(item.annualQty),palletId:r?.p?.id||null}));}}
+                        style={{display:"flex",alignItems:"center",gap:8,padding:"8px 10px",borderRadius:7,cursor:"pointer",background:isSel?"#eff6ff":"transparent",border:isSel?`1px solid ${C.blue}`:"1px solid transparent",marginBottom:3}}>
+                        <span style={{width:7,height:7,borderRadius:"50%",background:dot,flexShrink:0}}/>
+                        <div style={{flex:1,minWidth:0}}>
+                          <div style={{fontSize:12,fontWeight:isSel?600:400,color:isSel?C.blue:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.partNo||`#${i+1}`}</div>
+                          <div style={{fontSize:10,color:C.textMuted,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.tag} {item.w}×{item.d}×{item.h}</div>
+                        </div>
+                        {r?.qpp>0&&<span style={{fontSize:11,fontWeight:600,color:isSel?C.blue:C.textMuted,whiteSpace:"nowrap"}}>{fmt(r.estQ||r.qpp)}</span>}
+                      </div>
+                    );
+                  })}
+                </div>
+                {/* 우: 선택된 제품 결과 요약 */}
+                <div style={{...S.section,marginBottom:0}}>
+                  {selectedIdx===null?(
+                    <div style={S.msg}>좌측에서 품번을 선택하세요</div>
+                  ):(()=>{
+                    const item=batchItems[selectedIdx];
+                    const r=batchResults[selectedIdx];
+                    if(!r||r.error) return <div style={{...S.msg,color:C.red}}>{r?.error||"계산 오류"}</div>;
+                    const{p,best,qpp,estQ,avgFill,exactMatch,exactCount,tagMatchCount,noData,aq}=r;
+                    const cUC=qpp>0?Math.round(p.price/qpp):0;
+                    const cPC=qpp>0&&aq>0?Math.ceil(aq/qpp):0;
+                    const eUC=estQ?Math.round(p.price/estQ):0;
+                    const ePC=estQ&&aq>0?Math.ceil(aq/estQ):0;
+                    return(
+                      <div>
+                        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:14}}>
+                          <div>
+                            <div style={{fontSize:15,fontWeight:700,color:C.text}}>{item.partNo} <span style={{fontSize:12,fontWeight:400,color:C.textSub}}>{item.name}</span></div>
+                            <div style={{fontSize:12,color:C.textSub,marginTop:2}}>{item.tag} · {item.w}×{item.d}×{item.h}mm · {item.mass}kg · {p.name}</div>
+                          </div>
+                          <span style={{marginLeft:"auto",fontSize:11,...(exactMatch?{...S.tag("amber")}:noData?{...S.tag("amber")}:{...S.tag("blue")})}}>
+                            {exactMatch?"실적값 적용":noData?"비교군 없음":`충전율 ${avgFill?(avgFill*100).toFixed(1)+"%":"—"}`}
+                          </span>
+                        </div>
+                        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12,marginBottom:12}}>
+                          <div style={S.resultCard(C.blue)}><div style={{fontSize:11,color:C.textSub,marginBottom:4}}>계산 적입수량</div><div style={{fontSize:20,fontWeight:700,color:C.blue}}>{fmt(qpp)}</div><div style={{fontSize:11,color:C.textMuted}}>{best.cW}×{best.cD}×{best.cH} ({best.l})</div></div>
+                          <div style={S.resultCard(C.blue)}><div style={{fontSize:11,color:C.textSub,marginBottom:4}}>계산 개당 단가</div><div style={{fontSize:20,fontWeight:700,color:C.blue}}>₩{fmt(cUC)}</div><div style={{fontSize:11,color:C.textMuted}}>파렛트 {fmt(cPC)}개</div></div>
+                          <div style={S.resultCard(C.blue)}><div style={{fontSize:11,color:C.textSub,marginBottom:4}}>계산 연간 포장비</div><div style={{fontSize:20,fontWeight:700,color:C.blue}}>₩{fmt(p.price*cPC)}</div><div style={{fontSize:11,color:C.textMuted}}>{aq>0?fmt(aq)+"개 기준":""}</div></div>
+                        </div>
+                        {estQ?(
+                          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12}}>
+                            <div style={S.resultCard(exactMatch?C.amber:C.green)}><div style={{fontSize:11,color:C.textSub,marginBottom:4}}>{exactMatch?"실적 적입수량":"추정 적입수량"}</div><div style={{fontSize:20,fontWeight:700,color:exactMatch?C.amber:C.green}}>{fmt(estQ)}</div><div style={{fontSize:11,color:C.textMuted}}>{exactMatch?`DB ${exactCount}개 평균`:`충전율 적용`}</div></div>
+                            <div style={S.resultCard(exactMatch?C.amber:C.green)}><div style={{fontSize:11,color:C.textSub,marginBottom:4}}>{exactMatch?"실적 개당 단가":"추정 개당 단가"}</div><div style={{fontSize:20,fontWeight:700,color:exactMatch?C.amber:C.green}}>₩{fmt(eUC)}</div><div style={{fontSize:11,color:C.textMuted}}>파렛트 {fmt(ePC)}개</div></div>
+                            <div style={S.resultCard(exactMatch?C.amber:C.green)}><div style={{fontSize:11,color:C.textSub,marginBottom:4}}>{exactMatch?"실적 연간 포장비":"추정 연간 포장비"}</div><div style={{fontSize:20,fontWeight:700,color:exactMatch?C.amber:C.green}}>₩{fmt(p.price*ePC)}</div><div style={{fontSize:11,color:C.textMuted}}>{aq>0?fmt(aq)+"개 기준":""}</div></div>
+                          </div>
+                        ):noData?(
+                          <div style={{background:"#fff7ed",border:"1px solid #fed7aa",borderRadius:8,padding:"12px 16px",display:"flex",alignItems:"center",gap:10}}>
+                            <span style={{fontSize:18}}>⚠️</span>
+                            <div><div style={{fontSize:13,fontWeight:600,color:"#9a3412",marginBottom:2}}>데이터베이스에 비교군이 없습니다</div>
+                            <div style={{fontSize:12,color:"#c2410c"}}>태그 "{item.tag}"와 일치하는 제품이 DB에 없어 추정값을 산출할 수 없습니다.</div></div>
+                          </div>
+                        ):null}
+                      </div>
+                    );
+                  })()}
+                </div>
+              </div>
+            )}
 
             {/* KPI CARDS */}
             <div style={S.kpiGrid}>
-              <KpiCard label="계산 적입수량" value={kpiQpp>0?fmt(kpiQpp):"—"} unit={kpiQpp>0?"개/파렛트":""} color="#4f8ef7" sub={qResult?.best?`${qResult.best.l} 방향`:undefined}/>
-              <KpiCard label="추정 적입수량" value={kpiEstQ?fmt(kpiEstQ):"—"} unit={kpiEstQ?"개/파렛트":""} color="#22c55e" sub={fillPct?`충전율 ${fillPct}% 적용`:undefined}/>
-              <KpiCard label="계산 개당 단가" value={kpiUnitCost>0?`₩${fmt(kpiUnitCost)}`:"—"} unit={selectedPallet?.name||""} color="#a78bfa"/>
-              <KpiCard label="연간 총 포장비" value={kpiTotalCost>0?`₩${fmt(Math.round(kpiTotalCost/10000))}만`:"—"} unit={kpiTotalCost>0?`파렛트 ${fmt(Math.ceil(kpiAq/(kpiEstQ||kpiQpp||1)))}개`:""} color="#f59e0b"/>
+              <KpiCard label="계산 적입수량" value={kpiQpp>0?fmt(kpiQpp):"—"} unit={kpiQpp>0?"개/파렛트":""} color={C.blue} sub={qResult?.best?`${qResult.best.l} 방향`:undefined}/>
+              <KpiCard label="추정/실적 적입수량" value={kpiEstQ?fmt(kpiEstQ):"—"} unit={kpiEstQ?"개/파렛트":""} color={C.green} sub={qResult?.exactMatch?"DB 실적값 직접 적용":fillPct?`충전율 ${fillPct}% 적용`:undefined}/>
+              <KpiCard label="계산 개당 단가" value={kpiUnitCost>0?`₩${fmt(kpiUnitCost)}`:"—"} unit={selectedPallet?.name||""} color={C.purple}/>
+              <KpiCard label="연간 총 포장비" value={kpiTotalCost>0?`₩${fmt(Math.round(kpiTotalCost/10000))}만`:"—"} unit={kpiTotalCost>0?`파렛트 ${fmt(Math.ceil(kpiAq/(kpiEstQ||kpiQpp||1)))}개`:""} color={C.amber}/>
             </div>
 
             <div style={{display:"grid",gridTemplateColumns:"1fr 340px",gap:20}}>
@@ -190,7 +571,7 @@ export default function App(){
                 {/* 제품 정보 */}
                 <div style={S.section}>
                   <div style={S.sectionTitle}>
-                    <span style={{width:3,height:14,background:"#4f8ef7",borderRadius:2,display:"inline-block"}}/>
+                    <span style={{width:3,height:14,background:C.blue,borderRadius:2,display:"inline-block"}}/>
                     신규 제품 정보
                   </div>
                   <div style={{...S.grid6,marginBottom:14}}>
@@ -199,7 +580,7 @@ export default function App(){
                         <label style={S.label}>{lbl}</label>
                         <input type={type} value={quote[key]} onChange={e=>setQ(key,e.target.value)}
                           placeholder={ph} style={S.input} list={key==="tag"?"qtags":undefined}
-                          onFocus={e=>e.target.style.borderColor="#4f8ef7"} onBlur={e=>e.target.style.borderColor="#1e2535"}/>
+                          onFocus={e=>e.target.style.borderColor=C.blue} onBlur={e=>e.target.style.borderColor=C.inputBorder}/>
                       </div>
                     ))}
                     <datalist id="qtags">{allTags.map(t=><option key={t} value={t}/>)}</datalist>
@@ -209,27 +590,27 @@ export default function App(){
                       {analyzing?"🔍 AI 분석 중...":quote.image?"✓ 사진 등록됨":"📷 사진 업로드 (AI 형상 분석)"}
                       <input type="file" accept="image/*" style={{display:"none"}} onChange={e=>handleQuoteImg(e.target.files[0])}/>
                     </label>
-                    {quote.image&&<img src={quote.image} style={{width:56,height:44,objectFit:"cover",borderRadius:6,border:"1px solid #1e2535"}}/>}
-                    {quote.shapeData?.shape_tags?.length>0&&<span style={{fontSize:12,color:"#4a5568"}}>{quote.shapeData.shape_tags.join(", ")}</span>}
+                    {quote.image&&<img src={quote.image} style={{width:56,height:44,objectFit:"cover",borderRadius:6,border:`1px solid ${C.border}`}}/>}
+                    {quote.shapeData?.shape_tags?.length>0&&<span style={{fontSize:12,color:C.textSub}}>{quote.shapeData.shape_tags.join(", ")}</span>}
                   </div>
                 </div>
 
                 {/* 파렛트 선택 */}
                 <div style={S.section}>
                   <div style={S.sectionTitle}>
-                    <span style={{width:3,height:14,background:"#a78bfa",borderRadius:2,display:"inline-block"}}/>
+                    <span style={{width:3,height:14,background:C.purple,borderRadius:2,display:"inline-block"}}/>
                     파렛트 선택
-                    {matched.length>0&&<span style={{marginLeft:"auto",fontSize:11,color:"#22c55e",fontWeight:400}}>✓ 유사 제품 기준 자동 선택됨</span>}
+                    {matched.length>0&&<span style={{marginLeft:"auto",fontSize:11,color:C.green,fontWeight:400}}>✓ 유사 제품 기준 자동 선택됨</span>}
                   </div>
                   <div style={S.palletGrid}>
                     {PALLETS.map(p=>{
                       const net=netKg(p),sel=quote.palletId===p.id;
                       return(
                         <div key={p.id} style={S.palletCard(sel)} onClick={()=>setQ("palletId",p.id)}>
-                          <div style={{fontSize:13,fontWeight:600,color:sel?"#4f8ef7":"#e8eaf0",marginBottom:4}}>{p.name}</div>
-                          <div style={{fontSize:11,color:"#4a5568",marginBottom:2}}>{p.w}×{p.d}×{p.h} mm</div>
-                          <div style={{fontSize:11,color:"#4a5568",marginBottom:6}}>실적재 {fmt(net)} kg</div>
-                          <div style={{fontSize:14,fontWeight:700,color:sel?"#4f8ef7":"#9aa3b2"}}>₩{fmt(p.price)}</div>
+                          <div style={{fontSize:13,fontWeight:600,color:sel?C.blue:C.text,marginBottom:4}}>{p.name}</div>
+                          <div style={{fontSize:11,color:C.textSub,marginBottom:2}}>{p.w}×{p.d}×{p.h} mm</div>
+                          <div style={{fontSize:11,color:C.textMuted,marginBottom:6}}>실적재 {fmt(net)} kg</div>
+                          <div style={{fontSize:14,fontWeight:700,color:sel?C.blue:C.textSub}}>₩{fmt(p.price)}</div>
                         </div>
                       );
                     })}
@@ -241,36 +622,36 @@ export default function App(){
                   <>
                     <div style={S.section}>
                       <div style={S.sectionTitle}>
-                        <span style={{width:3,height:14,background:"#22c55e",borderRadius:2,display:"inline-block"}}/>
+                        <span style={{width:3,height:14,background:C.green,borderRadius:2,display:"inline-block"}}/>
                         방향별 적입 분석
-                        <span style={{marginLeft:"auto",fontSize:11,color:"#4a5568",fontWeight:400}}>6가지 배치 · 최적 자동 선택</span>
+                        <span style={{marginLeft:"auto",fontSize:11,color:C.textMuted,fontWeight:400}}>6가지 배치 · 최적 자동 선택</span>
                       </div>
                       <div style={S.orientGrid}>
                         {qResult.orients.map(o=>{
                           const isB=o===qResult.best;
                           return(
                             <div key={o.l} style={S.orientCard(isB,o.lim)}>
-                              <div style={{fontSize:11,color:isB?"#22c55e":o.lim?"#f59e0b":"#4a5568",marginBottom:4,fontWeight:600}}>
+                              <div style={{fontSize:11,color:isB?"#15803d":o.lim?"#b45309":C.textSub,marginBottom:4,fontWeight:600}}>
                                 {o.l}{isB&&" ★"}
                               </div>
-                              <div style={{fontSize:18,fontWeight:700,color:isB?"#22c55e":o.lim?"#f59e0b":"#e8eaf0"}}>{o.qpp>0?fmt(o.qpp):"—"}</div>
-                              <div style={{fontSize:10,color:"#4a5568"}}>{o.qpp>0?`${o.cW}×${o.cD}×${o.cH}`:""}</div>
-                              {qResult.mass>0&&o.qpp>0&&<div style={{fontSize:10,color:o.lim?"#f59e0b":"#4a5568",marginTop:3}}>{parseFloat((o.qpp*qResult.mass).toFixed(1)).toLocaleString()}kg{o.lim?" ⚠":""}</div>}
+                              <div style={{fontSize:18,fontWeight:700,color:isB?"#15803d":o.lim?"#b45309":C.text}}>{o.qpp>0?fmt(o.qpp):"—"}</div>
+                              <div style={{fontSize:10,color:C.textMuted}}>{o.qpp>0?`${o.cW}×${o.cD}×${o.cH}`:""}</div>
+                              {qResult.mass>0&&o.qpp>0&&<div style={{fontSize:10,color:o.lim?"#b45309":C.textMuted,marginTop:3}}>{parseFloat((o.qpp*qResult.mass).toFixed(1)).toLocaleString()}kg{o.lim?" ⚠":""}</div>}
                             </div>
                           );
                         })}
                       </div>
                       {qResult.mass>0&&qResult.best.qpp>0&&(()=>{
                         const tw=qResult.best.qpp*qResult.mass,pct=Math.min(100,tw/qResult.net*100);
-                        const bc=pct>=100?"#ef4444":pct>=80?"#f59e0b":"#22c55e";
+                        const bc=pct>=100?C.red:pct>=80?C.amber:C.green;
                         return(
                           <div style={S.weightBar}>
-                            <div style={{display:"flex",justifyContent:"space-between",fontSize:12,color:"#4a5568",marginBottom:2}}>
+                            <div style={{display:"flex",justifyContent:"space-between",fontSize:12,color:C.textSub,marginBottom:2}}>
                               <span>제품 적재 중량 (최적 방향)</span>
                               <span style={{color:bc,fontWeight:600}}>{parseFloat(tw.toFixed(1)).toLocaleString()}kg / {fmt(qResult.net)}kg</span>
                             </div>
                             <div style={S.barTrack}><div style={{height:"100%",width:`${pct}%`,background:bc,borderRadius:3,transition:"width 0.4s"}}/></div>
-                            <div style={{display:"flex",justifyContent:"space-between",fontSize:11,color:"#4a5568"}}>
+                            <div style={{display:"flex",justifyContent:"space-between",fontSize:11,color:C.textMuted}}>
                               <span>한계 {fmt(qResult.p.maxKg)}kg − 자중 {qResult.p.tare}kg = 실적재 {fmt(qResult.net)}kg</span>
                               <span style={{color:bc}}>{pct.toFixed(1)}% 사용</span>
                             </div>
@@ -282,43 +663,59 @@ export default function App(){
                     {/* 견적 결과 */}
                     <div style={S.section}>
                       <div style={S.sectionTitle}>
-                        <span style={{width:3,height:14,background:"#f59e0b",borderRadius:2,display:"inline-block"}}/>
+                        <span style={{width:3,height:14,background:C.amber,borderRadius:2,display:"inline-block"}}/>
                         견적 결과
                       </div>
                       {qResult.qpp<=0?<div style={S.msg}>어떤 방향으로도 제품이 들어가지 않습니다.</div>:!qResult.aq?<div style={S.msg}>연간 생산수량을 입력하세요</div>:(()=>{
-                        const{p,best,qpp,avgFill,estQ,pVol,pv,net,mass,aq}=qResult;
+                        const{p,best,qpp,avgFill,estQ,pVol,pv,net,mass,aq,exactMatch,exactCount,tagMatchCount}=qResult;
                         const cPC=Math.ceil(aq/qpp),cUC=p.price/qpp,cTC=p.price*cPC;
                         return(
                           <>
-                            <div style={{marginBottom:8,fontSize:12,color:"#4a5568"}}>
+                            <div style={{marginBottom:8,fontSize:12,color:C.textSub}}>
                               계산값 <span style={S.tag("blue")}>최적 방향 이론치</span>{best.lim&&<span style={{...S.tag("amber"),marginLeft:6}}>중량 제한</span>}
                             </div>
                             <div style={S.resultGrid}>
-                              <div style={S.resultCard("#4f8ef7")}><div style={{fontSize:11,color:"#4a5568",marginBottom:6}}>계산 적입수량</div><div style={{fontSize:22,fontWeight:700,color:"#4f8ef7"}}>{fmt(qpp)}</div><div style={{fontSize:11,color:"#4a5568",marginTop:2}}>개/파렛트 · {best.cW}×{best.cD}×{best.cH}</div></div>
-                              <div style={S.resultCard("#4f8ef7")}><div style={{fontSize:11,color:"#4a5568",marginBottom:6}}>계산 개당 단가</div><div style={{fontSize:22,fontWeight:700,color:"#4f8ef7"}}>₩{fmt(cUC)}</div><div style={{fontSize:11,color:"#4a5568",marginTop:2}}>{p.name}</div></div>
-                              <div style={S.resultCard("#4f8ef7")}><div style={{fontSize:11,color:"#4a5568",marginBottom:6}}>계산 연간 포장비</div><div style={{fontSize:22,fontWeight:700,color:"#4f8ef7"}}>₩{fmt(cTC)}</div><div style={{fontSize:11,color:"#4a5568",marginTop:2}}>파렛트 {fmt(cPC)}개</div></div>
+                              <div style={S.resultCard(C.blue)}><div style={{fontSize:11,color:C.textSub,marginBottom:6}}>계산 적입수량</div><div style={{fontSize:22,fontWeight:700,color:C.blue}}>{fmt(qpp)}</div><div style={{fontSize:11,color:C.textMuted,marginTop:2}}>개/파렛트 · {best.cW}×{best.cD}×{best.cH}</div></div>
+                              <div style={S.resultCard(C.blue)}><div style={{fontSize:11,color:C.textSub,marginBottom:6}}>계산 개당 단가</div><div style={{fontSize:22,fontWeight:700,color:C.blue}}>₩{fmt(cUC)}</div><div style={{fontSize:11,color:C.textMuted,marginTop:2}}>{p.name}</div></div>
+                              <div style={S.resultCard(C.blue)}><div style={{fontSize:11,color:C.textSub,marginBottom:6}}>계산 연간 포장비</div><div style={{fontSize:22,fontWeight:700,color:C.blue}}>₩{fmt(cTC)}</div><div style={{fontSize:11,color:C.textMuted,marginTop:2}}>파렛트 {fmt(cPC)}개</div></div>
                             </div>
-                            {estQ!==null&&(()=>{
+                            {estQ!==null?(()=>{
                               const ePC=Math.ceil(aq/estQ),eUC=p.price/estQ,eTC=p.price*ePC;
+                              const isExact=exactMatch;
+                              const color=isExact?C.amber:C.green;
                               return(
                                 <>
                                   <hr style={S.divider}/>
-                                  <div style={{marginBottom:8,fontSize:12,color:"#4a5568"}}>
-                                    추정값 <span style={S.tag("green")}>충전율 {fmtF(avgFill)} 적용</span>
+                                  <div style={{marginBottom:8,fontSize:12,color:C.textSub}}>
+                                    {isExact
+                                      ?<>실적값 <span style={S.tag("amber")}>DB 동일 제품 {exactCount}개 기준</span></>
+                                      :<>추정값 <span style={S.tag("green")}>동일 태그 {tagMatchCount}개 충전율 {fmtF(avgFill)} 적용</span></>
+                                    }
                                   </div>
                                   <div style={S.resultGrid}>
-                                    <div style={S.resultCard("#22c55e")}><div style={{fontSize:11,color:"#4a5568",marginBottom:6}}>추정 적입수량</div><div style={{fontSize:22,fontWeight:700,color:"#22c55e"}}>{fmt(estQ)}</div><div style={{fontSize:11,color:"#4a5568",marginTop:2}}>충전율 {fmtF(estQ*pv/pVol)}</div></div>
-                                    <div style={S.resultCard("#22c55e")}><div style={{fontSize:11,color:"#4a5568",marginBottom:6}}>추정 개당 단가</div><div style={{fontSize:22,fontWeight:700,color:"#22c55e"}}>₩{fmt(eUC)}</div><div style={{fontSize:11,color:"#4a5568",marginTop:2}}>{p.name}</div></div>
-                                    <div style={S.resultCard("#22c55e")}><div style={{fontSize:11,color:"#4a5568",marginBottom:6}}>추정 연간 포장비</div><div style={{fontSize:22,fontWeight:700,color:"#22c55e"}}>₩{fmt(eTC)}</div><div style={{fontSize:11,color:"#4a5568",marginTop:2}}>파렛트 {fmt(ePC)}개</div></div>
+                                    <div style={S.resultCard(color)}><div style={{fontSize:11,color:C.textSub,marginBottom:6}}>{isExact?"실적 적입수량":"추정 적입수량"}</div><div style={{fontSize:22,fontWeight:700,color}}>{fmt(estQ)}</div><div style={{fontSize:11,color:C.textMuted,marginTop:2}}>{isExact?"DB 실적 기준":`충전율 ${fmtF(estQ*pv/pVol)}`}</div></div>
+                                    <div style={S.resultCard(color)}><div style={{fontSize:11,color:C.textSub,marginBottom:6}}>{isExact?"실적 개당 단가":"추정 개당 단가"}</div><div style={{fontSize:22,fontWeight:700,color}}>₩{fmt(eUC)}</div><div style={{fontSize:11,color:C.textMuted,marginTop:2}}>{p.name}</div></div>
+                                    <div style={S.resultCard(color)}><div style={{fontSize:11,color:C.textSub,marginBottom:6}}>{isExact?"실적 연간 포장비":"추정 연간 포장비"}</div><div style={{fontSize:22,fontWeight:700,color}}>₩{fmt(eTC)}</div><div style={{fontSize:11,color:C.textMuted,marginTop:2}}>파렛트 {fmt(ePC)}개</div></div>
                                   </div>
                                 </>
                               );
-                            })()}
+                            })():(
+                              <>
+                                <hr style={S.divider}/>
+                                <div style={{background:"#fff7ed",border:"1px solid #fed7aa",borderRadius:8,padding:"12px 16px",display:"flex",alignItems:"center",gap:10}}>
+                                  <span style={{fontSize:18}}>⚠️</span>
+                                  <div>
+                                    <div style={{fontSize:13,fontWeight:600,color:"#9a3412",marginBottom:2}}>데이터베이스에 비교군이 없습니다</div>
+                                    <div style={{fontSize:12,color:"#c2410c"}}>태그 "{quote.tag}"와 일치하는 제품이 DB에 없어 추정값을 산출할 수 없습니다. DB에 동일 태그 제품을 먼저 등록해 주세요.</div>
+                                  </div>
+                                </div>
+                              </>
+                            )}
                             <hr style={S.divider}/>
-                            <div style={{fontSize:11,color:"#4a5568",lineHeight:2}}>
-                              실적재: {fmt(p.maxKg)}kg − {p.tare}kg = <b style={{color:"#9aa3b2"}}>{fmt(net)}kg</b>　|　
-                              최적 ({best.l}): {best.cW}×{best.cD}×{best.cH} = {fmt(best.qs)}개{best.lim?` → 중량 제한 = `:" = "}<b style={{color:"#9aa3b2"}}>{fmt(qpp)}개/파렛트</b>
-                              {estQ!==null&&<><br/>추정: {fmt(Math.round(pVol/1000))}㎤ × {fmtF(avgFill)} ÷ {fmt(Math.round(pv/1000))}㎤ = <b style={{color:"#9aa3b2"}}>{fmt(estQ)}개/파렛트</b></>}
+                            <div style={{fontSize:11,color:C.textSub,lineHeight:2}}>
+                              실적재: {fmt(p.maxKg)}kg − {p.tare}kg = <b style={{color:C.text}}>{fmt(net)}kg</b>　|　
+                              최적 ({best.l}): {best.cW}×{best.cD}×{best.cH} = {fmt(best.qs)}개{best.lim?` → 중량 제한 = `:" = "}<b style={{color:C.text}}>{fmt(qpp)}개/파렛트</b>
+                              {estQ!==null&&<><br/>{exactMatch?`DB 동일 제품 ${exactCount}개 평균 → 실적값 적용`:`동일 태그 ${tagMatchCount}개 충전율 평균 → `}<b style={{color:C.text}}>{fmt(estQ)}개/파렛트</b></>}
                             </div>
                           </>
                         );
@@ -332,38 +729,72 @@ export default function App(){
               <div>
                 <div style={S.section}>
                   <div style={S.sectionTitle}>
-                    <span style={{width:3,height:14,background:"#22c55e",borderRadius:2,display:"inline-block"}}/>
+                    <span style={{width:3,height:14,background:C.green,borderRadius:2,display:"inline-block"}}/>
                     유사 제품 매칭
-                    {matched.length>0&&<span style={{marginLeft:"auto",fontSize:11,color:"#4a5568",fontWeight:400}}>{matched.length}개</span>}
+                    {matched.length>0&&<span style={{marginLeft:"auto",fontSize:11,color:C.textMuted,fontWeight:400}}>{matched.length}개</span>}
                   </div>
                   {matched.length===0?(
-                    <div style={{textAlign:"center",padding:"2rem 1rem",color:"#4a5568",fontSize:12}}>제품 사이즈를 입력하면<br/>자동 매칭됩니다</div>
-                  ):(
+                    <div style={{textAlign:"center",padding:"2rem 1rem",color:C.textMuted,fontSize:12}}>제품 사이즈를 입력하면<br/>자동 매칭됩니다</div>
+                  ):(()=>{
+                    const nf=shapeFeatures(+quote.w,+quote.d,+quote.h);
+                    return(
                     <>
+                      {nf&&(
+                        <div style={{background:"#f8fafc",border:`1px solid ${C.border}`,borderRadius:7,padding:"10px 12px",marginBottom:10,fontSize:11}}>
+                          <div style={{fontWeight:600,color:C.textSub,marginBottom:5}}>신규 제품 형상 분석</div>
+                          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:4,color:C.textSub}}>
+                            <span>형상: <b style={{color:C.text}}>{shapeLabel(nf)}</b></span>
+                            <span>납작도: <b style={{color:C.text}}>{(nf.flatness*100).toFixed(0)}%</b></span>
+                            <span>길쭉도: <b style={{color:C.text}}>{nf.elongation.toFixed(1)}x</b></span>
+                            <span>부피: <b style={{color:C.text}}>{fmt(Math.round(nf.volume/1000))}㎤</b></span>
+                          </div>
+                        </div>
+                      )}
                       <div style={{marginBottom:10}}>
                         {matched.slice(0,8).map((m,i)=>{
                           const mp=PALLETS.find(x=>x.id===m.palletId);
                           const isTop=i===0;
+                          const isExact=m.exactMatch;
+                          const mf=shapeFeatures(+m.w,+m.d,+m.h);
                           return(
-                            <div key={m.id} style={S.matchCard(isTop)}>
-                              <span style={{fontSize:11,fontWeight:700,color:isTop?"#22c55e":"#4a5568",minWidth:20}}>#{i+1}</span>
+                            <div key={m.id} style={{display:"flex",alignItems:"center",gap:10,padding:"9px 12px",borderRadius:8,background:isExact?"#fffbeb":isTop?"#f0fdf4":"transparent",border:isExact?"1px solid #fcd34d":isTop?"1px solid #86efac":"1px solid transparent",marginBottom:6}}>
+                              <span style={{fontSize:11,fontWeight:700,color:isExact?C.amber:isTop?C.green:C.textMuted,minWidth:20}}>#{i+1}</span>
                               <div style={{flex:1,minWidth:0}}>
-                                <div style={{fontSize:12,fontWeight:600,color:isTop?"#e8eaf0":"#9aa3b2",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{m.tag||"—"}</div>
-                                <div style={{fontSize:11,color:"#4a5568"}}>{m.w}×{m.d}×{m.h}　{mp?mp.name:""}</div>
+                                <div style={{fontSize:12,fontWeight:600,color:isExact?"#92400e":isTop?"#15803d":C.text,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>
+                                  {m.tag||"—"}{isExact&&<span style={{fontSize:10,background:"#fef3c7",color:"#92400e",borderRadius:3,padding:"1px 5px",marginLeft:5,fontWeight:700}}>동일 제품</span>}
+                                </div>
+                                <div style={{fontSize:11,color:C.textSub}}>{m.w}×{m.d}×{m.h}　{mp?mp.name:""}　<span style={{color:C.green,fontWeight:600}}>{fmt(m.actual)}개</span>
+                                  {mf&&<span style={{color:C.textMuted}}> · {shapeLabel(mf)}</span>}
+                                </div>
                               </div>
-                              <span style={{fontSize:12,fontWeight:700,color:isTop?"#22c55e":"#4a5568"}}>{m.score.toFixed(0)}</span>
+                              <span style={{fontSize:12,fontWeight:700,color:isExact?C.amber:isTop?C.green:C.textMuted}}>{m.score.toFixed(0)}</span>
                             </div>
                           );
                         })}
-                        {matched.length>8&&<div style={{fontSize:11,color:"#4a5568",textAlign:"center",padding:"6px 0"}}>+ {matched.length-8}개 충전율 계산에 포함</div>}
+                        {matched.length>8&&<div style={{fontSize:11,color:C.textMuted,textAlign:"center",padding:"6px 0"}}>+ {matched.length-8}개 더 있음</div>}
                       </div>
-                      {qResult?.avgFill&&(
-                        <div style={{background:"rgba(34,197,94,0.05)",border:"1px solid #22c55e33",borderRadius:8,padding:"12px",textAlign:"center"}}>
-                          <div style={{fontSize:11,color:"#4a5568",marginBottom:4}}>평균 충전율</div>
-                          <div style={{fontSize:24,fontWeight:700,color:"#22c55e"}}>{fmtF(qResult.avgFill)}</div>
-                          <div style={{fontSize:11,color:"#4a5568",marginTop:2}}>{matched.length}개 제품 기반</div>
+                      {qResult?.exactMatch?(
+                        <div style={{background:"#fffbeb",border:"1px solid #fcd34d",borderRadius:8,padding:"12px",textAlign:"center"}}>
+                          <div style={{fontSize:11,color:"#92400e",marginBottom:4}}>동일 제품 매칭</div>
+                          <div style={{fontSize:20,fontWeight:700,color:C.amber}}>실적값 직접 적용</div>
+                          <div style={{fontSize:11,color:"#b45309",marginTop:2}}>DB 동일 제품 {qResult.exactCount}개 평균</div>
                         </div>
-                      )}
+                      ):qResult?.avgFill?(
+                        <div style={{background:"#f0fdf4",border:"1px solid #86efac",borderRadius:8,padding:"12px",textAlign:"center"}}>
+                          <div style={{fontSize:11,color:"#15803d",marginBottom:4}}>3요소 필터 적용 충전율</div>
+                          <div style={{fontSize:24,fontWeight:700,color:C.green}}>{fmtF(qResult.avgFill)}</div>
+                          <div style={{fontSize:11,color:"#15803d",marginTop:2}}>{qResult.tagMatchCount}개 제품 기반</div>
+                          <div style={{fontSize:10,color:C.textMuted,marginTop:3}}>태그 + 형상비율 + 부피구간 ±50%</div>
+                        </div>
+                      ):quote.tag?(
+                        <div style={{background:"#fff7ed",border:"1px solid #fed7aa",borderRadius:8,padding:"12px",textAlign:"center"}}>
+                          <div style={{fontSize:13,fontWeight:600,color:"#9a3412",marginBottom:4}}>⚠️ 비교군 없음</div>
+                          <div style={{fontSize:11,color:"#c2410c"}}>태그 "{quote.tag}"와<br/>일치하는 DB 제품이 없습니다</div>
+                        </div>
+                      ):null}
+                    </>
+                    );
+                  })()}
                     </>
                   )}
                 </div>
@@ -442,27 +873,27 @@ export default function App(){
                   onFocus={e=>e.target.style.borderColor="#4f8ef7"} onBlur={e=>e.target.style.borderColor="#1e2535"}/>
               </div>
               <div style={{display:"grid",gridTemplateColumns:"repeat(3,auto) 1fr repeat(3,auto) auto",gap:"6px 16px",padding:"6px 12px",marginBottom:6,borderBottom:"1px solid #1e2535"}}>
-                {["구분","파렛트","사이즈","품명","중량","적입수",""].map((h,i)=><div key={i} style={{fontSize:11,color:"#4a5568",fontWeight:600,letterSpacing:"0.04em"}}>{h}</div>)}
+                {["구분","파렛트","사이즈","품명","중량","적입수",""].map((h,i)=><div key={i} style={{fontSize:11,color:C.textSub,fontWeight:600,letterSpacing:"0.04em"}}>{h}</div>)}
               </div>
               {pageDb.map(item=>{
                 const p=PALLETS.find(x=>x.id===item.palletId);
                 return(
                   <div key={item.id} style={S.dbRow}>
-                    <span style={{fontSize:12,fontWeight:600,color:"#4f8ef7",minWidth:90,flexShrink:0}}>{item.tag||"—"}</span>
-                    <span style={{fontSize:11,color:"#4a5568",minWidth:90,flexShrink:0}}>{p?p.name:"—"}</span>
-                    <span style={{fontSize:11,color:"#4a5568",minWidth:120,flexShrink:0}}>{item.w>0?`${item.w}×${item.d}×${item.h}mm`:"—"}</span>
-                    <span style={{fontSize:12,color:"#9aa3b2",flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.name||item.partNo||"—"}</span>
-                    <span style={{fontSize:11,color:"#4a5568",minWidth:60,flexShrink:0}}>{item.mass}kg</span>
-                    <span style={{fontSize:12,fontWeight:600,color:"#22c55e",minWidth:70,flexShrink:0,textAlign:"right"}}>{fmt(item.actual)}개</span>
+                    <span style={{fontSize:12,fontWeight:600,color:C.blue,minWidth:90,flexShrink:0}}>{item.tag||"—"}</span>
+                    <span style={{fontSize:11,color:C.textSub,minWidth:90,flexShrink:0}}>{p?p.name:"—"}</span>
+                    <span style={{fontSize:11,color:C.textSub,minWidth:120,flexShrink:0}}>{item.w>0?`${item.w}×${item.d}×${item.h}mm`:"—"}</span>
+                    <span style={{fontSize:12,color:C.textSub,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.name||item.partNo||"—"}</span>
+                    <span style={{fontSize:11,color:C.textSub,minWidth:60,flexShrink:0}}>{item.mass}kg</span>
+                    <span style={{fontSize:12,fontWeight:600,color:C.green,minWidth:70,flexShrink:0,textAlign:"right"}}>{fmt(item.actual)}개</span>
                     <button onClick={()=>setDb(prev=>prev.filter(x=>x.id!==item.id))}
-                      style={{background:"none",border:"none",cursor:"pointer",color:"#4a5568",fontSize:16,padding:"0 4px",flexShrink:0}}>×</button>
+                      style={{background:"none",border:"none",cursor:"pointer",color:C.textSub,fontSize:16,padding:"0 4px",flexShrink:0}}>×</button>
                   </div>
                 );
               })}
               {totalPages>1&&(
                 <div style={{display:"flex",gap:8,justifyContent:"center",marginTop:14}}>
                   <button onClick={()=>setDbPage(p=>Math.max(0,p-1))} disabled={dbPage===0} style={S.btn("default")}>이전</button>
-                  <span style={{fontSize:12,color:"#4a5568",lineHeight:"34px"}}>{dbPage+1} / {totalPages}</span>
+                  <span style={{fontSize:12,color:C.textSub,lineHeight:"34px"}}>{dbPage+1} / {totalPages}</span>
                   <button onClick={()=>setDbPage(p=>Math.min(totalPages-1,p+1))} disabled={dbPage===totalPages-1} style={S.btn("default")}>다음</button>
                 </div>
               )}
